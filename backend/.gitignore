@@ -14,5 +14,9 @@ __pycache__/
 .venv/
 venv/
 
+# 日志
+logs/
+
 # 环境变量
 .env
+

@@ -396,11 +396,20 @@ async def get_url_tracking_stats(task_group_id: str) -> list[dict]:
     """获取变更统计：每个 URL 的变更次数和时间"""
     db = await get_db()
     try:
+        conditions = ["ut.change_count > 0"]
+        params: list = []
+        if task_group_id:
+            conditions.append(
+                "ut.last_seen_task_id IN (SELECT id FROM tasks WHERE task_group_id = ?)"
+            )
+            params.append(task_group_id)
+        where = "WHERE " + " AND ".join(conditions)
+        params.append(50)
         cursor = await db.execute(
-            """SELECT ut.url, ut.change_count, ut.last_changed_at, ut.last_seen_at
-               FROM url_tracking ut
-               WHERE ut.change_count > 0
-               ORDER BY ut.change_count DESC LIMIT 50"""
+            f"SELECT ut.url, ut.change_count, ut.last_changed_at, ut.last_seen_at "
+            f"FROM url_tracking ut "
+            f"{where} ORDER BY ut.change_count DESC LIMIT ?",
+            params,
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
