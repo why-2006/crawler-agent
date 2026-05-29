@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -17,6 +18,7 @@ from app.agent.prompts import (
     DECISION_PROMPT_TEMPLATE,
     EXTRACTION_PROMPT_TEMPLATE,
     INSIGHTS_PROMPT_TEMPLATE,
+    PAGE_ANALYSIS_PROMPT_TEMPLATE,
     STEER_PROMPT_TEMPLATE,
 )
 from app.agent.tools import ALL_TOOLS, set_fetcher
@@ -41,11 +43,26 @@ from app.storage.database import (
 class CrawlerAgent:
     """通用爬虫 Agent：编排抓取、链接发现、数据提取、LLM 决策的完整循环"""
 
-    BATCH_SIZE = 4
-    CONCURRENT_FETCH = 3
-    STEER_INTERVAL = 8
-    STEER_SAMPLE_SIZE = 30
-    INSIGHTS_SAMPLE_SIZE = 30
+    # ===== 多阶段循环常量 =====
+    BATCH_SIZE = 4               # 保留兼容
+    CONCURRENT_FETCH = 3         # 并发抓取数
+    STEER_INTERVAL = 8           # 前沿引导间隔（页数）
+    STEER_SAMPLE_SIZE = 30       # 前沿引导采样数
+    INSIGHTS_SAMPLE_SIZE = 30    # 数据洞察采样数
+
+    # 时间阈值（秒）
+    FETCH_INTERVAL = 2.0         # 抓取间隔
+    ANALYSIS_INTERVAL = 5.0      # LLM 页面分析间隔
+    PUSH_INTERVAL = 2.0          # 前端推送间隔
+    LOOP_SLEEP = 0.1             # 循环空闲等待
+
+    # 数量阈值
+    FETCH_THRESHOLD = 10         # URL 队列超过此数立即抓取
+    ANALYSIS_THRESHOLD = 4       # 待分析页超过此数立即分析
+
+    # 批处理大小
+    FETCH_BATCH_SIZE = 4         # 每批抓取 URL 数
+    ANALYSIS_BATCH_SIZE = 4      # 每批分析页面数
 
     def __init__(
         self,
@@ -73,11 +90,18 @@ class CrawlerAgent:
 
         self.results: list[dict[str, Any]] = []
         self.pages_crawled = 0
-        self.content_hashes: set[str] = set()
-        self._should_stop = False
-        self._last_steer_at = 0
-        self.changes_detected = 0
+        self.content_hashes: set[str] = set()# 已抓取页面内容的哈希值集合，用于快速去重
+        self._should_stop = False# 是否应该停止任务
+        self.changes_detected = 0# 变更检测到的页面数量
         self._last_insights: list[dict[str, Any]] = []
+
+        # 多阶段循环状态
+        self.page_queue: list[PageData] = []        # 已抓取待 LLM 分析的页面
+        self._analyzed_urls: set[str] = set()       # 已分析过的页面 URL，避免重复
+        self._last_fetch: float = 0.0               # 上次抓取时间
+        self._last_analysis: float = 0.0            # 上次分析时间
+        self._last_push: float = 0.0                # 上次推送时间
+        self._last_push_result_count: int = 0       # 上次推送时的结果数
 
         self.llm = ChatOpenAI(
             model=settings.llm_model,
@@ -115,57 +139,51 @@ class CrawlerAgent:
         self,
         progress_callback: Callable | None = None,
     ) -> list[dict[str, Any]]:
-        """执行爬取任务：并发抓取 + 批量 LLM 提取 + 数据洞察 + 变更检测"""
+        """多阶段循环：抓取 → LLM 分析 → 推送，时间/阈值双触发"""
         try:
             await self._report(progress_callback, "progress", message="开始抓取种子 URL...")
 
+            # 种子 URL 抓取 → 加入 page_queue 等待 LLM 分析
             page = await self._fetch_page(self.seed_url, depth=0)
             if not page:
                 return self.results
-            new_links = self._discover_links(page, depth=0)
-            self.frontier.enqueue_batch([(l.url, l.depth) for l in new_links])
+            self.page_queue.append(page)
 
-            await self._extract_and_store(page, progress_callback)
+            # 初始化各 Phase 时钟
+            t = time.monotonic()
+            self._last_fetch = 0.0
+            self._last_analysis = 0.0
+            self._last_push = t
 
-            page_buffer: list[PageData] = []
-
-            while self.frontier.has_pending() and self.pages_crawled < self.max_pages:
-                if self._should_stop:
-                    await self._report(progress_callback, "progress", message="任务被用户停止")
+            # ===== 主循环：3 阶段协作 =====
+            while not self._should_stop:
+                if self._is_done():
+                    break
+                if self.pages_crawled >= self.max_pages and len(self.page_queue) == 0:
                     break
 
-                batch_urls = self._dequeue_batch(self.BATCH_SIZE)
-                if not batch_urls:
-                    break
+                now = time.monotonic()
 
-                pages = await self._fetch_concurrent(batch_urls)
-                if not pages:
-                    continue
+                # Phase 1: URL 队列 → 抓取页面
+                if self._should_fetch(now):
+                    await self._phase_fetch()
+                    self._last_fetch = time.monotonic()
 
-                unique_pages = []
-                for p in pages:
-                    ch = content_hash(p.text_content[:2000])
-                    if ch not in self.content_hashes:
-                        self.content_hashes.add(ch)
-                        unique_pages.append(p)
-                    if self.pages_crawled < self.max_pages * 0.7:
-                        links = self._discover_links(p, depth=p.depth)
-                        for link in links:
-                            if link.depth <= self.max_depth:
-                                self.frontier.enqueue(link.url, link.depth)
+                # Phase 2: 页面 → LLM 分析（发现链接 + 提取数据）
+                if self._should_analyze(now):
+                    await self._phase_analyze_page(progress_callback)
+                    self._last_analysis = time.monotonic()
 
-                page_buffer.extend(unique_pages)
+                # Phase 3: 定期推送进度到前端
+                if self._should_push(now):
+                    await self._phase_push(progress_callback)
+                    self._last_push = time.monotonic()
 
-                if len(page_buffer) >= self.BATCH_SIZE:
-                    await self._extract_batch(page_buffer, progress_callback)
-                    page_buffer.clear()
+                await asyncio.sleep(self.LOOP_SLEEP)
 
-                if self.pages_crawled - self._last_steer_at >= self.STEER_INTERVAL:
-                    await self._steer_frontier()
-                    self._last_steer_at = self.pages_crawled
-
-            if page_buffer:
-                await self._extract_batch(page_buffer, progress_callback)
+            # 清空残余 page_queue
+            while self.page_queue:
+                await self._phase_analyze_page(progress_callback)
 
             # 数据洞察
             if len(self.results) >= 3:
@@ -195,6 +213,125 @@ class CrawlerAgent:
                 result.append(item)
         return result
 
+    # ─── 多阶段循环：退出条件 ─────────────────────────────────
+
+    def _is_done(self) -> bool:
+        """URL 队列和页面队列都为空时退出"""
+        return not self.frontier.has_pending() and len(self.page_queue) == 0
+
+    # ─── 多阶段循环：触发条件 ─────────────────────────────────
+
+    def _should_fetch(self, now: float) -> bool:
+        return (
+            self.frontier.has_pending()
+            and self.pages_crawled < self.max_pages
+            and (
+                now - self._last_fetch >= self.FETCH_INTERVAL
+                or self.frontier.pending_count() > self.FETCH_THRESHOLD
+            )
+        )
+
+    def _should_analyze(self, now: float) -> bool:
+        return len(self.page_queue) > 0 and (
+            now - self._last_analysis >= self.ANALYSIS_INTERVAL
+            or len(self.page_queue) >= self.ANALYSIS_THRESHOLD
+        )
+
+    def _should_push(self, now: float) -> bool:
+        return (
+            len(self.results) > self._last_push_result_count
+            and now - self._last_push >= self.PUSH_INTERVAL
+        )
+
+    # ─── 多阶段循环：Phase 方法 ──────────────────────────────
+
+    async def _phase_fetch(self) -> None:
+        """Phase 1: URL 队列出队 → 并发抓取 → 去重后加入 page_queue"""
+        batch = self._dequeue_batch(self.FETCH_BATCH_SIZE)
+        if not batch:
+            return
+        pages = await self._fetch_concurrent(batch)
+        for p in pages:
+            ch = content_hash(p.text_content[:2000])
+            if ch not in self.content_hashes:
+                self.content_hashes.add(ch)
+                self.page_queue.append(p)
+
+    async def _phase_analyze_page(self, progress_callback: Callable | None) -> None:
+        """Phase 2: 页面数据交给 LLM → 发现链接 + 提取数据"""
+        batch = self.page_queue[:self.ANALYSIS_BATCH_SIZE]
+
+        for page in batch:
+            if page.url in self._analyzed_urls:
+                continue
+
+            prompt = PAGE_ANALYSIS_PROMPT_TEMPLATE.format(
+                data_description=self.data_description,
+                pages_crawled=self.pages_crawled,
+                max_pages=self.max_pages,
+                max_depth=self.max_depth,
+                pending_count=self.frontier.pending_count(),
+                page_url=page.url,
+                page_title=page.title,
+                page_html=page.html[:5000],
+                page_text=page.text_content[:3000],
+            )
+
+            try:
+                response = await self.llm.ainvoke(prompt)
+                result = self._parse_llm_json(response)
+
+                # LLM 返回的 URL → 规范化 + 域名/深度/去重检查后入队
+                for url in result.get("selected_urls", []):
+                    normalized = normalize_url(url, base_url=page.url)
+                    if normalized and is_same_domain(normalized, self.seed_url):
+                        if not self.frontier.is_visited(normalized):
+                            depth = self._get_depth(normalized)
+                            if depth <= self.max_depth:
+                                self.frontier.enqueue(normalized, depth)
+
+                # LLM 返回的数据 → 存入 results
+                items = result.get("extracted_items", [])
+                for item in items:
+                    self.results.append({"source_url": page.url, "data": item})
+                if items:
+                    await self._report(
+                        progress_callback, "data_extracted",
+                        url=page.url, items=items,
+                    )
+
+            except Exception as e:
+                print(f"[警告] LLM 页面分析失败 {page.url}: {e}")
+
+            self._analyzed_urls.add(page.url)
+
+        # 从 page_queue 中移除已分析页面
+        self.page_queue = [p for p in self.page_queue if p.url not in self._analyzed_urls]
+
+    async def _phase_push(self, progress_callback: Callable | None) -> None:
+        """Phase 3: 定期推送进度到前端"""
+        await self._report(
+            progress_callback, "progress",
+            message=(
+                f"进度: {self.pages_crawled} 页已抓取, {len(self.results)} 条已提取, "
+                f"队列: {self.frontier.pending_count()} 待抓取, "
+                f"{len(self.page_queue)} 待分析"
+            ),
+        )
+        self._last_push_result_count = len(self.results)
+
+    def _parse_llm_json(self, response: Any) -> dict:
+        """通用 JSON 解析：去 markdown 代码块 → parse"""
+        text = response.content if hasattr(response, "content") else str(response)
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+        return json.loads(text)
+
+    # 并发抓取多个页面，返回成功抓取的页面数据列表
     async def _fetch_concurrent(self, urls: list[tuple[str, int]]) -> list[PageData]:
         async def fetch_one(url: str, depth: int) -> PageData | None:
             try:
@@ -210,7 +347,7 @@ class CrawlerAgent:
         tasks = [fetch_one(url, depth) for url, depth in urls]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return [r for r in results if isinstance(r, PageData)]
-
+    # 批量提取页面数据，优先使用批量提取提示，如果失败则回退到单页提取
     async def _extract_batch(
         self, pages: list[PageData], progress_callback: Callable | None
     ) -> None:
@@ -258,7 +395,7 @@ class CrawlerAgent:
         except Exception as e:
             print(f"[错误] 抓取失败 {url}: {e}")
             return None
-
+    #提取页面中的链接，并进行过滤：去除蜜罐链、非页面链接、跨域链接、已访问链接，以及根据规则应该跳过的链接，返回 LinkInfo 列表
     def _discover_links(self, page: PageData, depth: int) -> list[LinkInfo]:
         links = self.fetcher.extract_links(page)
 
@@ -286,7 +423,7 @@ class CrawlerAgent:
                 continue
             result.append(LinkInfo(url=normalized, text=text, depth=depth + 1))
         return result
-
+    #提取链接并进行过滤：去除蜜罐链、非页面链接、跨域链接、已访问链接，以及根据规则应该跳过的链接，返回 LinkInfo 列表
     async def _extract_and_store(
         self, page: PageData, progress_callback: Callable | None
     ) -> None:
@@ -350,7 +487,7 @@ class CrawlerAgent:
             urls = [url for url, _ in pending[:3]]
             self.frontier.remove_urls(set(urls))
             return urls
-
+    #前沿引导：调用 LLM 判断哪些待抓取 URL 更有可能包含目标数据，优先抓取这些 URL，同时跳过明显质量较差或与目标无关的 URL，从而优化爬取效率和结果质量
     async def _steer_frontier(self) -> None:
         pending = self.frontier.get_pending_urls()
         if len(pending) <= self.STEER_SAMPLE_SIZE // 2:
@@ -464,7 +601,7 @@ class CrawlerAgent:
         seed_segments = len(seed_path.split("/"))
         url_segments = len(url_path.split("/"))
         return max(1, url_segments - seed_segments + 1)
-
+    
     async def _invoke_extract_llm(self, prompt: str) -> list[dict]:
         """调用 extract_llm 并解析 JSON 对象中的 items 数组"""
         response = await self.extract_llm.ainvoke(prompt)
@@ -498,7 +635,7 @@ class CrawlerAgent:
             data: dict[str, Any] = {
                 "type": event_type,
                 "pages_crawled": self.pages_crawled,
-                "pages_discovered": self.frontier.pending_count() + self.pages_crawled,
+                "pages_discovered": self.frontier.pending_count() + self.pages_crawled + len(self.page_queue),
             }
             if url:
                 data["url"] = url

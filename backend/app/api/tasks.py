@@ -276,11 +276,11 @@ async def _run_crawl(
         task_group_id=task_group_id,
         schedule_next_run=None,
     )
-
+    #更新任务状态为 running，并记录开始时间
     await update_task_status(task_id, TaskStatus.running.value, started_at=now)
-
+    #创建任务数据目录
     task_data_dir = Path(settings.task_data_dir) / task_id
-
+    #广播任务开始事件
     async def progress_callback(event: dict[str, Any]) -> None:
         await manager.broadcast(task_id, event)
         if event["type"] in ("progress", "page_crawled", "data_extracted"):
@@ -292,29 +292,30 @@ async def _run_crawl(
             )
 
     agent = CrawlerAgent(
-        seed_url=seed_url,
-        data_description=data_description,
-        max_depth=max_depth,
-        max_pages=max_pages,
-        use_javascript=use_javascript,
-        task_data_dir=task_data_dir,
-        recurring_interval_minutes=recurring_interval_minutes,
-        task_id=task_id,
-        anti_crawl_config=anti_crawl_config,
+        seed_url=seed_url,#种子URL
+        data_description=data_description,#数据描述
+        max_depth=max_depth,#最大爬取深度
+        max_pages=max_pages,#最大爬取页面数
+        use_javascript=use_javascript,#是否启用 JavaScript 渲染
+        task_data_dir=task_data_dir,#任务数据目录
+        recurring_interval_minutes=recurring_interval_minutes,#定时任务的重复间隔
+        task_id=task_id,#任务ID
+        anti_crawl_config=anti_crawl_config,#反爬配置
     )
+    #将正在运行的 agent 存储在全局字典中，以便在需要时可以停止它
     _running_agents[task_id] = agent
 
     try:
         results = await agent.run(progress_callback=progress_callback)
-
+        #如果任务成功完成，则保存爬取结果和洞察信息到数据库
         results_json = json.dumps(results, ensure_ascii=False)
         await save_task_results(task_id, results_json)
-
+        #如果 agent 有洞察信息，则保存到数据库
         if agent._last_insights:
             await save_task_insights(
                 task_id, json.dumps(agent._last_insights, ensure_ascii=False)
-            )#如果任务成功完成，则更新任务状态为 completed，并记录爬取的页面数、发现的页面数、结果数量和变更检测数量
-
+            )
+        #如果任务成功完成，则更新任务状态为 completed，并记录爬取的页面数、发现的页面数、结果数量和变更检测数量
         await update_task_status(
             task_id,
             TaskStatus.completed.value,

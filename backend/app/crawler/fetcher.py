@@ -533,12 +533,12 @@ class Fetcher:
         "iframe": ["src"],
         "frame": ["src"],
     }
-
+    #提取标签中的链接，并转换为绝对 URL，去重后返回列表
     def extract_links(self, page_data: PageData) -> list[tuple[str, str]]:
         soup = BeautifulSoup(page_data.html, "lxml")
         seen: set[str] = set()
         links: list[tuple[str, str]] = []
-
+        #添加链接的内部函数，负责过滤无效链接、转换为绝对 URL、去重，并保存链接文本
         def _add(href: str, text: str = "") -> None:
             if not href or href.startswith("javascript:") or href.startswith("#"):
                 return
