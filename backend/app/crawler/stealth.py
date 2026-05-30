@@ -98,10 +98,23 @@ class UserAgentRotator:
 
 
 class HeaderNormalizer:
-    """为 HTTP 请求补充浏览器典型请求头"""
+    """为 HTTP 请求补充浏览器典型请求头（值会随请求变化，降低指纹一致性）"""
+
+    _req_counter: int = 0
+
+    _AL_VARIANTS = [
+        "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7",
+        "zh-CN,zh;q=0.8,en;q=0.9,en-US;q=0.7",
+        "zh-CN,zh;q=0.9,en;q=0.7,en-US;q=0.8",
+        "zh-CN,zh;q=0.8,en;q=0.7,en-US;q=0.9",
+    ]
 
     @staticmethod
-    def normalize(base_headers: dict[str, str] | None = None) -> dict[str, str]:
+    def normalize(base_headers: dict[str, str] | None = None,
+                  referer_present: bool = False) -> dict[str, str]:
+        HeaderNormalizer._req_counter += 1
+        idx = HeaderNormalizer._req_counter % len(HeaderNormalizer._AL_VARIANTS)
+
         headers: dict[str, str] = {}
         if base_headers:
             headers.update(base_headers)
@@ -111,12 +124,16 @@ class HeaderNormalizer:
                 "text/html,application/xhtml+xml,application/xml;"
                 "q=0.9,image/avif,image/webp,*/*;q=0.8"
             ),
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Accept-Encoding": "gzip, deflate",
+            "Accept-Language": HeaderNormalizer._AL_VARIANTS[idx],
+            "Accept-Encoding": (
+                "gzip, deflate, br"
+                if HeaderNormalizer._req_counter % 3 == 0
+                else "gzip, deflate"
+            ),
             "Cache-Control": "no-cache",
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-Site": "same-origin" if referer_present else "none",
             "Sec-Fetch-User": "?1",
             "DNT": "1",
             "Upgrade-Insecure-Requests": "1",
@@ -167,7 +184,10 @@ async def retry_with_backoff(
             retryable = is_retryable(exc) if is_retryable else True
             if not retryable:
                 raise
-            wait = min(backoff_initial * (2 ** attempt) + random.uniform(0, 1), backoff_max)
+            # Full jitter: sleep = random(0, min(cap, base * 2^attempt))
+            # 将重试均匀分散到整个退避窗口，避免多客户端同时重试
+            cap = min(backoff_max, backoff_initial * (2 ** attempt))
+            wait = random.uniform(0, cap)
             await asyncio.sleep(wait)
 
     raise last_exc or RuntimeError("retry_with_backoff exhausted")

@@ -47,11 +47,29 @@ class SessionStore:
         return []
 
     def load_storage_state(self, domain: str) -> dict | None:
-        """返回 Playwright storage_state 格式的数据"""
+        """返回 Playwright storage_state 格式的数据（自动清理无效条目）"""
         data = self.load(domain)
         if not data:
             return None
-        state: dict[str, Any] = {"cookies": data.get("cookies", [])}
+
+        # 清理 cookies：过滤空 name，修复字符串 expires，补全缺失 domain
+        clean_cookies = []
+        for c in data.get("cookies", []):
+            if not c.get("name", "").strip():
+                continue
+            # Playwright 要求 cookie 必须有 url 或 domain+path 组合
+            if "domain" not in c:
+                c["domain"] = domain
+            exp = c.get("expires")
+            if isinstance(exp, str):
+                try:
+                    from email.utils import parsedate_to_datetime
+                    c["expires"] = parsedate_to_datetime(exp).timestamp()
+                except Exception:
+                    c["expires"] = -1
+            clean_cookies.append(c)
+
+        state: dict[str, Any] = {"cookies": clean_cookies}
         if "local_storage" in data:
             origins: list[dict] = []
             for key, value in data["local_storage"].items():
@@ -59,6 +77,13 @@ class SessionStore:
             if origins:
                 state["origins"] = origins
         return state
+
+    def load_user_agent(self, domain: str) -> str:
+        """返回保存的 User-Agent，无则返回空字符串"""
+        data = self.load(domain)
+        if data:
+            return data.get("user_agent", "")
+        return ""
 
     def delete(self, domain: str) -> None:
         path = self._domain_file(domain)

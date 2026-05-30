@@ -15,6 +15,9 @@ frontend/dist/
 # Env
 .env
 
+# Logs
+logs/
+
 # IDE
 .idea/
 .vscode/

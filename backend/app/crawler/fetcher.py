@@ -183,28 +183,66 @@ class Fetcher:
             cls._session_store = SessionStore()
         return cls._session_store
 
-    def __init__(self, task_data_dir: Path | None = None, anti_crawl_config=None):
+    def __init__(self, task_data_dir: Path | None = None, anti_crawl_config=None,
+                 seed_domain: str = ""):
         from app.models.schemas import AntiCrawlConfig
         self._task_data_dir = task_data_dir
         self._anti_crawl = anti_crawl_config if isinstance(anti_crawl_config, AntiCrawlConfig) else None
         self._captcha_solver: CaptchaSolver | None = None
+        self._captcha_fail_count: dict[str, int] = {}  # 域名 → 连续失败次数
+        self._seed_domain = seed_domain
+
+        # 熔断器：域名 → 解封时间戳（monotonic）
+        self._blocked_domains: dict[str, float] = {}
+
+        # 动态 Referer：域名 → 上次成功抓取的 URL
+        self._domain_last_url: dict[str, str] = {}
+
         if settings.captcha_api_key:
             self._captcha_solver = CaptchaSolver(
                 api_key=settings.captcha_api_key,
                 timeout=120,
             )
 
+    # ─── 熔断器 ──────────────────────────────────────────
+
+    def is_domain_blocked(self, domain: str) -> bool:
+        """检查域名是否被熔断器封锁（过期自动解封）"""
+        until = self._blocked_domains.get(domain)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            del self._blocked_domains[domain]
+            return False
+        return True
+
+    def _block_domain(self, domain: str) -> None:
+        """封锁域名（种子域永不封锁）"""
+        if domain == self._seed_domain:
+            return
+        cooldown = settings.circuit_breaker_cooldown_seconds
+        self._blocked_domains[domain] = time.monotonic() + cooldown
+        print(f"[断路器] 域名 {domain} 已被阻止 {cooldown}s，原因：连续验证码失败")
+
+    @property
+    def blocked_domains(self) -> set[str]:
+        """返回当前被封锁的域名集合（供 agent 清理队列）"""
+        now = time.monotonic()
+        return {d for d, until in self._blocked_domains.items() if until > now}
+
+    # ─── 浏览器管理 ──────────────────────────────────────
+
     @classmethod
     async def _get_browser(cls):
         if not _playwright_available:
             raise RuntimeError("playwright 未安装，无法使用 JS 渲染")
-        # 诊断：打印当前事件循环类型
-        try:
-            loop = asyncio.get_running_loop()
-            print(f"[调试] 当前事件循环类型: {type(loop).__name__}")
-        except RuntimeError:
-            print("[调试] 无运行中的事件循环")
         if cls._browser is None:
+            # 诊断：打印当前事件循环类型（仅首次启动时）
+            try:
+                loop = asyncio.get_running_loop()
+                print(f"[调试] 当前事件循环类型: {type(loop).__name__}")
+            except RuntimeError:
+                print("[调试] 无运行中的事件循环")
             cls._playwright_instance = await async_playwright().start()
             cls._browser = await cls._playwright_instance.chromium.launch(
                 headless=True,
@@ -227,6 +265,11 @@ class Fetcher:
         if extra:
             headers.update(extra)
 
+        # 动态 Referer：同域名上次成功抓取的 URL
+        referer = self._domain_last_url.get(domain)
+        if referer:
+            headers["Referer"] = referer
+
         ua_rotation = self._anti_crawl.ua_rotation if self._anti_crawl else settings.ua_rotation_enabled
         header_norm = self._anti_crawl.header_normalization if self._anti_crawl else settings.header_normalization
 
@@ -240,7 +283,7 @@ class Fetcher:
         headers["User-Agent"] = ua
 
         if header_norm:
-            headers = HeaderNormalizer.normalize(headers)
+            headers = HeaderNormalizer.normalize(headers, referer_present=bool(referer))
 
         return headers
 
@@ -275,11 +318,15 @@ class Fetcher:
         """
         检测并尝试识别验证码。
         返回 None 表示识别失败或不需要识别。
-        对于 reCAPTCHA/hCaptcha 返回 g-recaptcha-response token。
-        对于图片验证码返回验证码文本。
-        对于 Cloudflare 返回 None（需要浏览器环境）。
         """
         if not self._captcha_solver:
+            return None
+
+        domain = urlparse(url).netloc
+
+        # 同一域名连续失败 3 次，跳过后续验证码尝试
+        if self._captcha_fail_count.get(domain, 0) >= 3:
+            print(f"[CAPTCHA] {domain} 连续验证码失败 3 次，跳过后续尝试")
             return None
 
         has_captcha, captcha_type, info = needs_captcha_solve(html, url=url)
@@ -289,32 +336,52 @@ class Fetcher:
         print(f"[CAPTCHA] 检测到验证码: {captcha_type.value}")
 
         try:
+            result = None
             if captcha_type == CaptchaType.RECAPTCHA_V2:
                 sitekey = info.get("sitekey", "")
                 if sitekey:
-                    return await self._captcha_solver.solve_recaptcha_v2(sitekey, url)
+                    result = await self._captcha_solver.solve_recaptcha_v2(sitekey, url)
             elif captcha_type == CaptchaType.RECAPTCHA_V3:
                 sitekey = info.get("sitekey", "")
                 if sitekey:
-                    return await self._captcha_solver.solve_recaptcha_v3(sitekey, url)
+                    result = await self._captcha_solver.solve_recaptcha_v3(sitekey, url)
             elif captcha_type == CaptchaType.HCAPTCHA:
                 sitekey = info.get("sitekey", "")
                 if sitekey:
-                    return await self._captcha_solver.solve_hcaptcha(sitekey, url)
+                    result = await self._captcha_solver.solve_hcaptcha(sitekey, url)
             elif captcha_type == CaptchaType.IMAGE:
                 img_url = info.get("image_url", "")
                 if img_url:
-                    return await self._captcha_solver.solve_image_captcha(img_url)
+                    result = await self._captcha_solver.solve_image_captcha(img_url)
             elif captcha_type == CaptchaType.CLOUDFLARE:
                 print("[CAPTCHA] Cloudflare 验证，2captcha 不支持，请使用 JS 渲染模式")
+
+            if result:
+                self._captcha_fail_count[domain] = 0  # 成功则重置计数
+                return result
+            else:
+                self._captcha_fail_count[domain] = self._captcha_fail_count.get(domain, 0) + 1
+                # 熔断检查
+                if self._captcha_fail_count[domain] >= settings.circuit_breaker_threshold:
+                    self._block_domain(domain)
+                return None
         except Exception as e:
+            self._captcha_fail_count[domain] = self._captcha_fail_count.get(domain, 0) + 1
             print(f"[CAPTCHA] 识别异常: {e}")
+            # 熔断检查
+            if self._captcha_fail_count[domain] >= settings.circuit_breaker_threshold:
+                self._block_domain(domain)
 
         return None
 
     async def fetch_static(self, url: str, retry_captcha: bool = True) -> PageData:
         """httpx 静态抓取，自动检测并处理 CAPTCHA"""
         domain = urlparse(url).netloc
+
+        # 熔断器：被封锁域名直接跳过
+        if self.is_domain_blocked(domain):
+            raise RuntimeError(f"域名 {domain} 已被熔断器阻止，跳过抓取")
+
         await self._respect_rate_limit(domain)
 
         headers = self._build_headers(domain)
@@ -354,6 +421,7 @@ class Fetcher:
                         resp_for_session = resp2
                         html = resp2.text
 
+                self._domain_last_url[domain] = url
                 return self._parse_html(url, html, rendered=False)
 
         retry_enabled = self._anti_crawl.retry_enabled if self._anti_crawl else settings.retry_enabled
@@ -398,17 +466,31 @@ class Fetcher:
         if not _playwright_available:
             raise RuntimeError("playwright 未安装")
 
+        domain = urlparse(url).netloc
+
+        # 熔断器：被封锁域名直接跳过
+        if self.is_domain_blocked(domain):
+            raise RuntimeError(f"域名 {domain} 已被熔断器阻止，跳过 JS 渲染")
+
+        # 速率限制（JS 通道原先缺失）
+        await self._respect_rate_limit(domain)
+
         async with self._semaphore:
             browser = await self._get_browser()
-            domain = urlparse(url).netloc
-            pw_ua = (
-                self._get_ua_rotator().for_domain(domain)
-                if settings.ua_rotation_enabled
-                else (
+
+            # 优先使用登录时保存的 UA，保持与 Cookie 一致的指纹
+            saved_ua = ""
+            if self._session_enabled:
+                saved_ua = self._get_session_store().load_user_agent(domain)
+            if saved_ua:
+                pw_ua = saved_ua
+            elif settings.ua_rotation_enabled:
+                pw_ua = self._get_ua_rotator().for_domain(domain)
+            else:
+                pw_ua = (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
                 )
-            )
             proxy = self._get_proxy_manager().for_playwright(domain) or None
             storage_state = self._get_session_store().load_storage_state(domain) if self._session_enabled else None
             context = await browser.new_context(
@@ -424,16 +506,63 @@ class Fetcher:
                 # 手动补充指纹隐藏（playwright-stealth 可能未覆盖的字段）
                 if settings.playwright_stealth_enabled:
                     await page.add_init_script("""
+                        // 1. 隐藏 webdriver 标记
                         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+
+                        // 2. 伪装 plugins（真实浏览器至少有 PDF Viewer 等）
                         Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-                        Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN','zh','en']});
-                        window.chrome = {runtime: {}};
+
+                        // 3. 伪装语言偏好
+                        Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN','zh','en-US','en']});
+
+                        // 4. 伪装硬件并发数（真实桌面常见 4/8/16）
+                        Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+
+                        // 5. 伪装设备内存（真实桌面常见 4/8/16 GB）
+                        Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+
+                        // 6. 伪装屏幕尺寸以匹配 viewport
+                        Object.defineProperty(screen, 'width', {get: () => 1920});
+                        Object.defineProperty(screen, 'height', {get: () => 1080});
+                        Object.defineProperty(screen, 'availWidth', {get: () => 1920});
+                        Object.defineProperty(screen, 'availHeight', {get: () => 1040});
+                        Object.defineProperty(screen, 'colorDepth', {get: () => 24});
+                        Object.defineProperty(screen, 'pixelDepth', {get: () => 24});
+
+                        // 7. 伪装 WebGL 渲染器（headless 默认暴露 Google/ANGLE）
+                        try {
+                            const getParam = WebGLRenderingContext.prototype.getParameter;
+                            WebGLRenderingContext.prototype.getParameter = function(p) {
+                                if (p === 37445) return 'Intel Inc.';
+                                if (p === 37446) return 'Intel Iris OpenGL Engine';
+                                return getParam.call(this, p);
+                            };
+                        } catch(e) {}
+
+                        // 8. 恢复 chrome 对象（很多反爬脚本检测）
+                        window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}, app: {}};
+
+                        // 9. 伪装 Permissions API
+                        try {
+                            const origQuery = window.navigator.permissions.query;
+                            window.navigator.permissions.query = (parameters) => (
+                                parameters.name === 'notifications' ?
+                                    Promise.resolve({state: Notification.permission}) :
+                                    origQuery(parameters)
+                            );
+                        } catch(e) {}
                     """)
                 await page.route(
                     re.compile(r"\.(png|jpg|jpeg|gif|svg|webp|ico|woff2?|ttf|eot|mp4|mp3|avi)(\?.*)?$"),
                     lambda route: route.abort(),
                 )
-                await page.goto(url, wait_until="networkidle", timeout=settings.playwright_timeout_ms)
+                # 先尝试 networkidle（SPA 完整渲染），超时则降级为 load
+                try:
+                    await page.goto(url, wait_until="networkidle", timeout=15000)
+                except Exception:
+                    await page.goto(url, wait_until="load", timeout=settings.playwright_timeout_ms)
+                # 给动态内容额外渲染时间
+                await asyncio.sleep(2)
                 html = await page.content()
 
                 # 在浏览器中检测 Cloudflare 验证
@@ -446,10 +575,12 @@ class Fetcher:
                     await page.wait_for_load_state("networkidle", timeout=60000)
                     html = await page.content()
 
+                self._domain_last_url[domain] = url
                 return self._parse_html(url, html, rendered=True)
             except Exception:
                 try:
                     html = await page.content()
+                    self._domain_last_url[domain] = url
                     return self._parse_html(url, html, rendered=True)
                 except Exception:
                     raise
@@ -473,9 +604,17 @@ class Fetcher:
         """统一入口：先静态尝试，自动切换 JS 或处理 CAPTCHA"""
         try:
             page_data = await self.fetch_static(url)
-            if not use_javascript and not self._needs_js(page_data.text_content, page_data.html):
-                return page_data
-            if self._needs_js(page_data.text_content, page_data.html):
+
+            # 静态抓取后页面仍包含验证码 → 强制浏览器渲染重试
+            has_captcha, _, _ = needs_captcha_solve(page_data.html, url=url)
+            if has_captcha:
+                print("[CAPTCHA] 静态抓取遇到验证码，尝试浏览器渲染绕过...")
+                try:
+                    return await self.fetch_with_js(url)
+                except Exception as e:
+                    print(f"[CAPTCHA] 浏览器渲染也失败: {e}，返回静态页面")
+
+            if use_javascript or self._needs_js(page_data.text_content, page_data.html):
                 return await self.fetch_with_js(url)
             return page_data
         except Exception:

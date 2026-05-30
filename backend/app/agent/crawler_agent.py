@@ -6,6 +6,7 @@ import json
 import time
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from langchain.agents import AgentExecutor, create_openai_tools_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -85,7 +86,8 @@ class CrawlerAgent:
         self.task_id = task_id
 
         self.frontier = Frontier()
-        self.fetcher = Fetcher(task_data_dir=task_data_dir, anti_crawl_config=anti_crawl_config)
+        self.fetcher = Fetcher(task_data_dir=task_data_dir, anti_crawl_config=anti_crawl_config,
+                               seed_domain=urlparse(seed_url).netloc)
         set_fetcher(self.fetcher)
 
         self.results: list[dict[str, Any]] = []
@@ -158,8 +160,11 @@ class CrawlerAgent:
             # ===== 主循环：3 阶段协作 =====
             while not self._should_stop:
                 if self._is_done():
+                    print(f"[完成] 队列清空: url={self.frontier.pending_count()}, "
+                          f"page={len(self.page_queue)}, 结果={len(self.results)}")
                     break
                 if self.pages_crawled >= self.max_pages and len(self.page_queue) == 0:
+                    print(f"[完成] 达到最大页数: {self.pages_crawled}/{self.max_pages}")
                     break
 
                 now = time.monotonic()
@@ -247,6 +252,12 @@ class CrawlerAgent:
 
     async def _phase_fetch(self) -> None:
         """Phase 1: URL 队列出队 → 并发抓取 → 去重后加入 page_queue"""
+        # 清理被熔断器封锁的域名 URL
+        for domain in self.fetcher.blocked_domains:
+            removed = self.frontier.remove_by_domain(domain)
+            if removed > 0:
+                print(f"[断路器] 已从队列移除 {removed} 个来自域名 {domain} 的 URL")
+
         batch = self._dequeue_batch(self.FETCH_BATCH_SIZE)
         if not batch:
             return
@@ -265,6 +276,32 @@ class CrawlerAgent:
             if page.url in self._analyzed_urls:
                 continue
 
+            # 从渲染后的 DOM 中提取同域名链接列表，供 LLM 决策
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(page.html, "lxml")
+            all_links: list[str] = []
+            for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                text = a.get_text(strip=True)[:40]
+                if text and href and not href.startswith("#") and not href.startswith("javascript:"):
+                    normalized = normalize_url(href, base_url=page.url)
+                    if normalized and is_same_domain(normalized, self.seed_url):
+                        all_links.append(f"{text} → {normalized}")
+
+            # 去重 + 限制数量（避免 token 溢出）
+            seen = set()
+            unique_links: list[str] = []
+            for link in all_links:
+                if link not in seen:
+                    seen.add(link)
+                    unique_links.append(link)
+            links_text = "\n".join(unique_links[:100])
+
+            # 诊断
+            text_preview = page.text_content[:200].replace("\n", " ").strip()
+            print(f"[诊断] 页面: {page.title[:60]} | 文本={len(page.text_content)}字 | "
+                  f"链接={len(unique_links)}个")
+
             prompt = PAGE_ANALYSIS_PROMPT_TEMPLATE.format(
                 data_description=self.data_description,
                 pages_crawled=self.pages_crawled,
@@ -273,8 +310,8 @@ class CrawlerAgent:
                 pending_count=self.frontier.pending_count(),
                 page_url=page.url,
                 page_title=page.title,
-                page_html=page.html[:5000],
-                page_text=page.text_content[:3000],
+                page_text=page.text_content[:8000],
+                page_links=links_text if links_text else "（未找到同域名链接）",
             )
 
             try:
@@ -282,13 +319,26 @@ class CrawlerAgent:
                 result = self._parse_llm_json(response)
 
                 # LLM 返回的 URL → 规范化 + 域名/深度/去重检查后入队
-                for url in result.get("selected_urls", []):
+                urls_found = result.get("selected_urls", [])
+                urls_enqueued = 0
+                for url in urls_found:
                     normalized = normalize_url(url, base_url=page.url)
-                    if normalized and is_same_domain(normalized, self.seed_url):
-                        if not self.frontier.is_visited(normalized):
-                            depth = self._get_depth(normalized)
-                            if depth <= self.max_depth:
-                                self.frontier.enqueue(normalized, depth)
+                    if not normalized:
+                        continue
+                    if not is_same_domain(normalized, self.seed_url):
+                        continue
+                    if self.frontier.is_visited(normalized):
+                        continue
+                    depth = self._get_depth(normalized)
+                    if depth > self.max_depth:
+                        continue
+                    if self.frontier.enqueue(normalized, depth):
+                        urls_enqueued += 1
+
+                items = result.get("extracted_items", [])
+                print(f"[分析] {page.url} → {urls_enqueued}/{len(urls_found)} URL入队, "
+                      f"{len(items)} 条数据, 队列: url={self.frontier.pending_count()}, "
+                      f"page={len(self.page_queue)}, 已抓={self.pages_crawled}")
 
                 # LLM 返回的数据 → 存入 results
                 items = result.get("extracted_items", [])

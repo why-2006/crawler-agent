@@ -37,7 +37,12 @@ class Settings(BaseSettings):
     retry_max_attempts: int = 3
     retry_backoff_initial: float = 1.0  # 秒
     retry_backoff_max: float = 30.0  # 秒
-    retry_on_status: str = "429,503,502"  # 触发重试的 HTTP 状态码
+    retry_on_status: str = "429,503,502,403"  # 触发重试的 HTTP 状态码
+
+    # 域名级熔断器：同域名连续验证码失败 N 次后阻止该域名
+    circuit_breaker_threshold: int = 3
+    # 被熔断的域名冷却时间（秒），过期后可重新尝试
+    circuit_breaker_cooldown_seconds: int = 300
 
     # 代理
     proxy_url: str = ""  # http://user:pass@host:port 或 socks5://host:port

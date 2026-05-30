@@ -72,3 +72,16 @@ class Frontier:
             else:
                 self._queued_urls.discard(url)
         self._queue = new_queue
+
+    def remove_by_domain(self, domain: str) -> int:
+        """移除队列中指定域名的所有 URL，返回移除数量"""
+        removed = 0
+        new_queue: deque[tuple[str, int]] = deque()
+        for url, depth in self._queue:
+            if urlparse(url).netloc == domain:
+                self._queued_urls.discard(url)
+                removed += 1
+            else:
+                new_queue.append((url, depth))
+        self._queue = new_queue
+        return removed
